@@ -1,0 +1,423 @@
+---
+title: "Covid19_Project"
+author: "Anonymous"
+date: "2024-09-09"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Important libraries
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(zoo)  # For calculating the rolling mean (moving average) in time series data
+library(MASS) # For Negative Binomial model
+```
+
+
+### Covid-19 Analysis
+
+
+In this project, I utilize three time series CSV files that provide data on COVID-19 cases, deaths, and vaccinations. Two of the files can be accessed [here](https://github.com/CSSEGISandData/COVID-19/tree/master/csse_covid_19_data/csse_covid_19_time_series), and the third file is available [here](https://github.com/govex/COVID-19/tree/master/data_tables/vaccine_data/us_data).
+These datasets are no longer updated. The first two files are sourced from the Johns Hopkins Center for Systems Science and Engineering (CSSE), while the third is obtained from the Bloomberg Center for Government Excellence (GovEx). A data dictionary is available [here](https://github.com/govex/COVID-19/blob/master/data_tables/vaccine_data/us_data/data_dictionary.csv).
+
+
+### Project Goal
+
+The main goal of this project is to predict daily COVID-19 deaths in Colorado, while also taking time to explore and understand the dataset. For the prediction, we compare two models that are well-suited for count data, such as daily death counts: the Poisson Generalized Linear Model (GLM) and the Negative Binomial GLM.
+
+
+### Import Dataset
+
+Let's now proceed with **importing** the relevant datasets:
+
+```{r import data, message=FALSE, warning=FALSE}
+url_in <- str_c("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/",
+                "csse_covid_19_data/csse_covid_19_time_series/")
+
+file_names <- c("time_series_covid19_confirmed_US.csv",  
+                "time_series_covid19_deaths_US.csv")
+
+urls <- str_c(url_in, file_names)
+US_cases_raw <- read_csv(urls[1])
+US_deaths_raw <- read_csv(urls[2])
+
+vaccine_raw <- read_csv("https://raw.githubusercontent.com/govex/COVID-19/master/data_tables/vaccine_data/us_data/time_series/time_series_covid19_vaccine_us.csv")
+
+```
+
+### Tidy and Transform Datasets
+
+After importing the files, we will proceed with **tidying** and **transforming** the data to ensure it is well-structured and ready for analysis.
+
+```{r tidy and transform case & death data, message=FALSE, warning=FALSE}
+US_cases <- US_cases_raw %>% 
+    pivot_longer(cols = -(UID:Combined_Key), 
+                 names_to = "date", 
+                 values_to = "cases")
+
+
+US_cases_by_state <- US_cases %>% 
+    mutate(date = mdy(date)) %>% 
+    group_by(Province_State, date) %>% 
+    summarize(cases = sum(cases)) 
+
+
+US_deaths <- US_deaths_raw %>% 
+    pivot_longer(cols = -(UID:Population), 
+                 names_to = "date", 
+                 values_to = "deaths") 
+
+US_deaths_by_state <- US_deaths %>%
+    mutate(date = mdy(date)) %>% 
+    group_by(Province_State, date) %>% 
+    summarize(deaths = sum(deaths)) 
+```
+
+In the next code window, we will merge the two tidied datasets. To refine our analysis, we will filter out additional territories such as the *District of Columbia* and US territories that do not have state status, focusing primarily on the 50 US states.
+
+```{r joining cases and deaths, message=FALSE, warning=FALSE}
+US <- US_cases_by_state %>% 
+    full_join(US_deaths_by_state) %>% 
+    filter(!Province_State %in% c("American Samoa", 
+                                  "District of Columbia", 
+                                  "Guam", 
+                                  "Northern Mariana Islands", 
+                                  "Puerto Rico", 
+                                  "Virgin Islands", 
+                                  "Diamond Princess", 
+                                  "Grand Princess",
+                                  "Virgin Islands"))
+```
+
+To ensure accuracy, we will verify the number and names of the states:
+
+```{r check US states for US dataset, message=FALSE, warning=FALSE}
+unique(US$Province_State)
+n_distinct(US$Province_State)
+```
+
+We will now also transform the dataset related to vaccinations:
+
+```{r transform vaccine data I, message=FALSE, warning=FALSE}
+vaccine_by_state <- vaccine_raw %>% 
+    group_by(Date, Province_State) %>% 
+    summarize(vaccine_doses = sum(Doses_admin)) %>% 
+    rename(date = Date)
+```
+
+Upon closer examination of the dataset, we find that it contains NA values. These are located in the variable `Province_state` and will be removed in the subsequent steps, along with states that are irrelevant for further analysis.
+
+```{r transform vaccine data II, message=FALSE, warning=FALSE}
+# Check for NAs
+(any_na <- any(is.na(vaccine_by_state)))
+vaccine_by_state %>% filter(is.na(Province_State))
+
+vaccine_by_state <- vaccine_by_state %>% 
+    filter(!Province_State %in% c("Long Term Care (LTC) Program",
+                                  "American Samoa", 
+                                  "Indian Health Services", 
+                                  "Northern Mariana Islands", 
+                                  "Veterans Health Administration", 
+                                  "Federal Bureau of Prisons", 
+                                  "Long Term Care",
+                                  "Marshall Islands",
+                                  "Northern Mariana Islands",
+                                  "Guam",
+                                  "Department of Defense",
+                                  "Puerto Rico",
+                                  "Virgin Islands",
+                                  "District of Columbia")) %>% 
+    filter(!is.na(Province_State))
+
+# Check if NA removal was successful
+(any_na <- any(is.na(vaccine_by_state)))
+
+# Check US states for vaccine dataset
+unique(vaccine_by_state$Province_State)
+n_distinct(vaccine_by_state$Province_State)
+```
+
+Finally, let's merge the datasets to consolidate our data and prepare it for the next stages of analysis. We will exclude the data from January 22, 2020, to December 14, 2020, as we do not have vaccination data for this period and will need it for later analysis.
+
+```{r joining cases, deaths and vaccines, message=FALSE, warning=FALSE}
+min(US$date, vaccine_by_state$date) 
+US_joined <- US %>% 
+    full_join(vaccine_by_state) %>% 
+    filter(date >= "2020-12-15")
+```
+
+In the next step, we will add the variables `daily_deaths`, `daily_cases`, and `daily_doses`, which will represent the new daily COVID-19 deaths, COVID-19 cases, and COVID-19 vaccinations, respectively. Additionally, we will remove any negative values from these variables, as negative numbers are not logically meaningful in this context.
+
+```{r add variables daily_deaths, daily_cases and daily_doses, message=FALSE, warning=FALSE}
+US_joined_extended <- US_joined %>%
+    arrange(Province_State, date) %>%  
+    group_by(Province_State) %>%      
+    mutate(
+        daily_deaths = deaths - lag(deaths, default = NA),              # For calculating daily deaths
+        daily_cases = cases - lag(cases, default = NA),                 # For calculating daily cases
+        daily_doses = vaccine_doses - lag(vaccine_doses, default = NA)  # For Calculating Daily Vaccine doses
+    ) %>%
+    ungroup() 
+
+US_cleaned <- US_joined_extended %>% filter(!daily_cases < 0,
+                                            !daily_deaths< 0,
+                                            !daily_doses < 0)
+```
+
+We are not quite finished yet; we will add the variables `doses_7day_mean` and `deaths_7day_mean`. The former represents the average number of vaccine doses over the past 7 days, while the latter indicates the average number of deaths over the past 7 days.
+
+```{r add variables doses_7day_mean and deaths_7day_mean, message=FALSE, warning=FALSE}
+US_complete <- US_cleaned %>%
+    arrange(Province_State, date) %>%  
+    group_by(Province_State) %>%       
+    mutate(
+        doses_7day_mean = rollmean(lag(daily_doses,1), k = 7, fill = NA, align = "right"),
+        deaths_7day_mean = rollmean(lag(daily_deaths,1), k = 7, fill = NA, align = "right")
+        ) %>%
+    ungroup()
+```
+
+When examining `US_complete`, we observe that the variables `doses_7day_mean` and `deaths_7day_mean` have produced NAs for the first 7 days (starting from 2020-12-16). We will remove these NAs accordingly.
+
+```{r view and delete NAs for US_complete dataset, message=FALSE, warning=FALSE}
+print(US_complete, n = 10)
+
+US_final <- US_complete %>% 
+    filter(date >= "2020-12-23")
+```
+
+### Analyzing Dataset
+
+To sharpen our understanding and intuition about the dataset and satisfy our curiosity, we will now examine the top 3 and bottom 3 US states with the highest and lowest daily death counts. The top 3 states are displayed in the upper graphs, while the bottom 3 states are shown in the lower graphs. To account for the absolute size of the states, they are ranked based on their **average** daily deaths.
+
+```{r top 3 & bottom 3 US states based on average daily deaths, message=FALSE, warning=FALSE}
+# Step 1: Calculate the average daily deaths for each state
+state_deaths <- US_final %>%
+    group_by(Province_State) %>%
+    summarise(avg_daily_deaths = mean(daily_deaths)) 
+
+# Step 2: Identify the top 3 and bottom 3 states
+top_3_states <- state_deaths %>%
+    arrange(desc(avg_daily_deaths)) %>%
+    slice_head(n = 3)
+
+bottom_3_states <- state_deaths %>%
+    arrange(avg_daily_deaths) %>%
+    slice_head(n = 3)
+
+# Combine the top and bottom states
+selected_states <- bind_rows(top_3_states, bottom_3_states)
+
+# Step 3: Filter the original data to include only the selected states
+filtered_data <- US_final %>%
+    filter(Province_State %in% selected_states$Province_State)
+
+# Create a factor to order the states: top 3 first, then bottom 3
+filtered_data$Province_State <- factor(filtered_data$Province_State, 
+                                       levels = c(top_3_states$Province_State, 
+                                                  bottom_3_states$Province_State)
+                                       )
+
+# Step 4: Create the plot using ggplot
+ggplot(filtered_data, aes(x = date, y = daily_deaths, color = Province_State)) +
+    geom_line(size = 0.8) +
+    labs(
+        title = "Daily Deaths for Top 3 and Bottom 3 US States",
+        x = "Date",
+        y = "Daily Deaths",
+        color = "US State"
+    ) +
+    theme(
+        legend.position = "bottom",
+        legend.title = element_blank(),                     # Remove legend title
+        axis.text.x = element_text(angle = 45, hjust = 1)   # Rotate the x-axis labels
+    ) +
+    facet_wrap(~ Province_State, 
+               ncol = 3, 
+               scales = "free_y") +       # Scale for the y-values adjusts automatically
+    scale_color_brewer(palette = "Dark2") # To change the colors of the graphs
+```
+
+Next, we will focus on Colorado and analyze how well we can predict daily COVID-19 deaths using daily COVID-19 cases, the 7-day average deaths, and the 7-day average vaccination doses, as previously described. To build and evaluate our models, we will split the dataset into a training set (approximately 70%) and a test set (approximately 30%). Since we will be using a Negative Binomial GLM, which often struggles with convergence, it is advisable to log-transform the necessary predictors to improve model performance and convergence.
+
+```{r Colorado selection and creating training and test data, message=FALSE, warning=FALSE}
+Colorado_model_data <- US_final %>% filter(Province_State == "Colorado")
+
+Colorado_model_data$log_daily_cases <- log1p(Colorado_model_data$daily_cases)
+Colorado_model_data$log_doses_7day_mean <- log1p(Colorado_model_data$doses_7day_mean)
+Colorado_model_data$log_deaths_7day_mean <- log1p(Colorado_model_data$deaths_7day_mean)
+
+train_data <- Colorado_model_data %>% filter(date <= "2022-07-11")
+test_data <- Colorado_model_data %>% filter(date > "2022-07-11")
+complete_data_size <- nrow(Colorado_model_data)
+(train_size <- nrow(train_data) / nrow(Colorado_model_data))
+(test_size <- nrow(test_data) / nrow(Colorado_model_data))
+```
+
+Now, let's build our two models: a Poisson GLM and a Negative Binomial GLM.
+
+```{r fit Poisson GLM & Negative Binomial GLM, message=FALSE, warning=FALSE}
+poisson_model <- glm(daily_deaths ~ daily_cases + 
+                                    deaths_7day_mean + 
+                                    doses_7day_mean + date,
+                     family = poisson(link = "log"),
+                     data = train_data)
+poisson_model
+
+negbinom_model <- glm.nb(daily_deaths ~ log_daily_cases  + 
+                                        log_deaths_7day_mean + 
+                                        log_doses_7day_mean + 
+                                        date, 
+                         data = train_data)
+negbinom_model
+```
+
+Here are the summary statistics for both models:
+
+```{r summary model fits}
+summary(poisson_model)
+summary(negbinom_model)
+```
+
+If overdispersion is present, it indicates that the variability in the data is greater than what the Poisson GLM assumes, making the negative binomial GLM potentially a better fit. Overdispersion occurs when the variance of the data exceeds the mean, which violates the assumption of the Poisson distribution that the mean and variance are equal. Let’s now check for the presence of overdispersion:
+
+```{r check for overdispersion, message=FALSE, warning=FALSE}
+deviance_poisson <- poisson_model$deviance
+df_poisson <- poisson_model$df.residual
+
+# Dispersion statistic
+disp_stat_poisson <- deviance_poisson / df_poisson
+print(paste("Dispersion Statistic for Poisson:", round(disp_stat_poisson,2)))
+
+# Since dispersion statistic is much greater than 1, overdispersion might be present
+```
+
+Comparing the Poisson GLM and the Negative Binomial GLM using AIC provides an additional measure of model performance. It helps evaluate which model better balances fit and complexity, especially when overdispersion is present. The AIC can reveal if the Negative Binomial GLM, which accounts for greater variability, provides a superior fit compared to the Poisson GLM.
+
+```{r AIC comparison for both models, message=FALSE, warning=FALSE}
+aic_poisson <- AIC(poisson_model)
+aic_negbinom <- AIC(negbinom_model)
+
+print(paste("AIC for Poisson GLM is :", aic_poisson))
+print(paste("AIC for Negative Binomial GLM is :", aic_negbinom))
+
+# Check if Negative Binomial fits better based on lower AIC
+if (aic_negbinom < aic_poisson) {
+    print("Negative Binomial GLM is preferred based on AIC.")
+} else {
+    print("Poisson GLM is preferred based on AIC.")
+}
+```
+
+Now that we have built our models, we will use the test dataset to make predictions based on each model. Subsequently, we will evaluate the accuracy of our predictions using the **Mean Squared Error (MSE)** and **Mean Absolute Error (MAE)** metrics.
+
+```{r predictions and accuracy, message=FALSE, warning=FALSE}
+# Make predictions on the test data
+poisson_predictions <- predict(poisson_model, newdata = test_data, type = "response")
+negbinom_predictions <- predict(negbinom_model, newdata = test_data, type = "response")
+
+# Evaluate the performance (Using MSE & MAE)
+mse_poisson <- mean((test_data$daily_deaths - poisson_predictions)^2)
+mse_negbinom <- mean((test_data$daily_deaths - negbinom_predictions)^2)
+
+mae_poisson <- mean(abs(test_data$daily_deaths - poisson_predictions))
+mae_negbinom <- mean(abs(test_data$daily_deaths - negbinom_predictions))
+
+print(paste("Mean Squared Error (MSE) for Poisson GLM is: ", round(mse_poisson,2)))
+print(paste("Mean Absolute Error (MAE) for Poisson GLM is: ", round(mae_poisson, 2)))
+print(paste("Mean Squared Error (MSE) for Negative Binomial GLM:", round(mse_negbinom, 2)))
+print(paste("Mean Absolute Error (MAE) for Negative Binomial GLM is: ", round(mae_negbinom, 2)))
+```
+
+Not surprisingly, the Negative Binomial GLM performs better than the Poisson GLM according to the selected evaluation criteria. Let us now compare the predictions from the **Negative Binomial GLM** and **Poisson GLM** with the actual daily death values in a graph. This comparison will be shown for both the **training and test datasets**.
+
+```{r, comparison predictions vs. actuals in training & test data, message=FALSE, warning=FALSE}
+## TRAINING data
+
+negbinom_training_predictions <- predict(negbinom_model, newdata = train_data, type = "response")
+poisson_training_predictions <- predict(poisson_model, newdata = train_data, type = "response")
+
+comparison_train <- train_data %>% 
+    mutate(
+        negbinom_training_predictions = negbinom_training_predictions,
+        poisson_training_predictions = poisson_training_predictions) %>% 
+    dplyr::select(Province_State, 
+                  date, 
+                  daily_deaths, 
+                  negbinom_training_predictions,
+                  poisson_training_predictions)
+
+# Create the ggplot comparing daily_deaths 
+# with Negative Binomial GLM / Poisson GLM for the training set over time
+
+ggplot(comparison_train, aes(x = date)) +
+    geom_line(aes(y = daily_deaths, 
+                  color = "Actual Daily Deaths"), 
+              size = 0.8) +                           # Plot actual daily deaths
+    geom_line(aes(y = negbinom_training_predictions, 
+                  color = "Non Binomial Predictions"), 
+              size = 0.8) +                           # Plot Non Binomial predictions
+    geom_line(aes(y = poisson_training_predictions, 
+                  color = "Poisson Predictions"), 
+              size = 0.8) +                           # Plot Poisson predictions
+    labs(
+        title = "Daily Deaths vs. Non Binomial / Poisson Predictions Over Time (Training Dataset)",
+        x = "Date",
+        y = "Count",
+        color = "Legend"
+        ) + 
+    theme(
+        plot.title = element_text(size = 12),       # Adjust title's size
+        legend.title = element_blank(),             # Remove legend title
+        axis.text.x = element_text(angle = 45, hjust = 1)) # Rotate the x-axis labels
+
+## TEST data
+
+comparison_test <- test_data %>%
+    mutate(negbinom_predictions = negbinom_predictions,
+           poisson_predictions = poisson_predictions) %>% 
+    dplyr::select(Province_State, 
+                  date, 
+                  daily_deaths, 
+                  negbinom_predictions,
+                  poisson_predictions)
+
+# Create the ggplot comparing daily_deaths 
+# with Negative Binomial GLM / Poisson GLM for the test set over time
+
+ggplot(comparison_test, aes(x = date)) +
+    geom_line(aes(y = daily_deaths, 
+                  color = "Actual Daily Deaths"), 
+              size = 0.8) +                           # Plot actual daily deaths
+    geom_line(aes(y = negbinom_predictions, 
+                  color = "Non Binomial Predictions"), 
+              size = 0.8) +                           # Plot Non Binomial predictions
+    geom_line(aes(y = poisson_predictions, 
+                  color = "Poisson Predictions"), 
+              size = 0.8) +                           # Plot Poisson predictions
+    labs(
+        title = "Daily Deaths vs. Non Binomial / Poisson Predictions Over Time (Test Dataset)",
+        x = "Date",
+        y = "Count",
+        color = "Legend"
+        ) + 
+    theme(
+        plot.title = element_text(size = 12),       # Adjust title's size
+        legend.title = element_blank(),             # Remove legend title
+        axis.text.x = element_text(angle = 45, hjust = 1)) # Rotate the x-axis labels
+```
+
+### Bias
+
+**Bias in the dataset** cannot be entirely ruled out, as COVID-19 figures are collected differently across states or tested at varying frequencies. For example, urban areas or wealthier states may have more testing resources available, leading to higher reported COVID-19 cases. To ensure consistency, I prioritized using datasets from a single source. As I progressed with my work, I recognized this issue, and although I initially selected a different vaccination dataset (which can be found [here](https://github.com/owid/covid-19-data/blob/master/public/data/vaccinations/us_state_vaccinations.csv)), I identified my **personal bias** towards quickly obtaining a vaccination dataset (i.e., availability bias). To address this, I continued searching and ultimately found the final vaccination dataset provided by Johns Hopkins, which I then used in my analysis. Additionally, to mitigate aggregation bias, I used the mean of daily COVID-19 deaths instead of the sum when creating the graph of the top 3 and bottom 3 US states by daily deaths.
+
+### Conclusion
+
+When comparing the two models, the Negative Binomial GLM performs better than the Poisson GLM, as expected. This is because the Negative Binomial GLM has a lower AIC value and is better suited for handling overdispersion in the dataset (where the variance exceeds the mean). Consequently, it is not surprising that the MSE and MAE metrics are lower for the Negative Binomial GLM compared to the Poisson GLM. However, the Negative Binomial GLM also struggles to fully capture the variance in the data, so it might be worthwhile to explore other models, such as Generalized Additive Models (GAMs) or time series models like ARIMA or SARIMA.

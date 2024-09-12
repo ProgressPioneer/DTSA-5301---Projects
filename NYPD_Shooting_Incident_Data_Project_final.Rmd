@@ -1,0 +1,284 @@
+---
+title: "NYPD Shooting Incident Data Project"
+author: "Anonymous"
+date: "2024-07-24"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Important libraries
+
+```{r libraries, message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(caTools)
+
+# libraries required for creating a scrollable dataset:
+library(DT) 
+library(shiny) # server-side processing (since dataset is too large otherwise)
+```
+
+
+### NYPD Shooting Incident Data (Historic)
+
+The following excerpt provides a brief summary of the dataset used here, extracted from *NYC OpenData* (<https://data.cityofnewyork.us/browse?q=shooting+incidents+historic>):
+
+List of every shooting incident that occurred in NYC going back to 2006 through the end of the previous calendar year.
+
+This is a breakdown of every shooting incident that occurred in NYC going back to 2006 through the end of the previous calendar year. This data is manually extracted every quarter and reviewed by the Office of Management Analysis and Planning before being posted on the NYPD website. Each record represents a shooting incident in NYC and includes information about the event, the location and time of occurrence. In addition, information related to suspect and victim demographics is also included.
+
+### Goal of this Project
+
+The goal of the project is to gain a deeper understanding of the dataset and to apply and familiarize ourselves with the logistic regression model for predicting the likelihood of a fatal outcome from a shooting, based on selected variables.
+
+### Import Dataset
+
+First we are going to load the **tidyverse** package. Afterwards, we're reading in the dataset of interest. Useful footnotes regarding the dataset (e.g. background information regarding missing data) can be downloaded here <https://data.cityofnewyork.us/api/views/833y-fsy8/files/e4e3d86c-348f-4a16-a17f-19480c089429?download=true&filename=NYPD_Shootings_Incident_Level_Data_Footnotes.pdf>.
+
+```{r import data, message=FALSE, warning=FALSE}
+url <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+raw_data <- read_csv(url)
+
+
+
+# Option: Code for displaying the dataset with scrolling functionality (html only)
+
+#datatable(
+  #raw_data, 
+  #options = list(
+    #scrollY = '400px',   # Set the vertical scroll size
+    #scrollX = TRUE,      # Enable horizontal scrolling
+    #server = TRUE,       # Enable server-side processing
+    #paging = TRUE,       # Enable pagination
+    #lengthMenu = c(10, 25, 50, 100), # Page length options
+    #pageLength = 10      # Default page length
+  #)
+#)
+```
+
+Let's take a first look at the summary statistics of the dataset:
+
+```{r, summary dataset}
+summary(raw_data)
+```
+
+
+### Tidy and Transform Data
+
+In this step, we are going to remove the variables (columns) that are not necessary for further analysis, rename some of the remaining variables and finally evaluate the variables for any missing data.
+
+```{r, relevant data selection}
+Key_columns_data <- raw_data %>% 
+  select(-c(INCIDENT_KEY, 
+            OCCUR_TIME,
+            LOC_OF_OCCUR_DESC:LOCATION_DESC,
+            VIC_AGE_GROUP:Lon_Lat))
+```
+
+```{r, renaming of variables}
+renamed_data <- Key_columns_data %>%
+  rename(
+    borough = BORO,
+    perpetrator_age_group = PERP_AGE_GROUP,
+    perpetrator_sex = PERP_SEX,
+    perpetrator_race = PERP_RACE
+  )
+renamed_data <- renamed_data %>%
+  mutate(borough = recode(borough,
+                               "BROOKLYN" = "Brooklyn",
+                               "MANHATTAN" = "Manhattan",
+                               "BRONX" = "Bronx",
+                               "QUEENS" = "Queens",
+                               "STATEN ISLAND" = "Staten Island"))
+```
+
+
+```{r, missing data detection}
+# Replace NA's with "Not availaible"
+na_replaced_data <- renamed_data %>% 
+  mutate(across(everything(), ~ifelse(is.na(.),"Not available",.)))
+
+# Checking if renaming of NA's was successful
+sum(is.na(na_replaced_data))
+sum(na_replaced_data == "Not available")
+
+# Check for all types of missing data 
+colSums(na_replaced_data  == c("Not available"))
+colSums(na_replaced_data  == c("UNKNOWN"))
+colSums(na_replaced_data  == c("(null)"))
+```
+
+While there is no certainty that our missing data are completely at random (MCAR), the assumption is practical given our considerable dataset. Thus, we will execute listwise deletion in the code that follows.
+
+```{r, missing data handling / removal}
+# Filtering out missing data
+complete_cases_data <- na_replaced_data %>% 
+  filter(!if_any(everything(),~ . %in% c("Not available", "(null)","UNKNOWN")))
+
+# Check if missing data deletion was successful
+sum(complete_cases_data == c("Not available","UNKNOWN","(null)"))
+```
+
+By observing the variable `perpetrator_age_group`, we notice that it includes outliers, which we will remove using the code below.
+
+```{r, outlier removal}
+# Outlier detection
+unique(complete_cases_data$perpetrator_age_group)
+
+# Outlier removal
+complete_cases_data <- complete_cases_data %>% 
+  filter(!(perpetrator_age_group %in% c("224", "940", "1020", "1028"))
+  )
+```
+
+Another important step in our analysis involves the correct classification of the various **variable types**.  
+
+```{r, variable type transformation as needed}
+str(complete_cases_data)
+
+# Transforming data types
+complete_cleaned_data <- complete_cases_data %>% 
+  mutate(across(c(borough, 
+                  perpetrator_age_group, 
+                  perpetrator_sex, perpetrator_race), 
+                  as.factor) %>% mutate(OCCUR_DATE = mdy(OCCUR_DATE)))
+
+# Checking variable types again
+str(complete_cleaned_data)
+```
+
+### Data Visualization
+
+To gain a better understanding of the dataset, let us illustrate the total number of shooting victims by borough and the perpetrator's race:
+
+```{r, visualization 1}
+# Total number of shooting victims in each borough by perpetrator's race
+ggplot(data = complete_cleaned_data) + 
+  geom_bar(mapping = aes(x = borough, fill = perpetrator_race)) +
+  labs(x = "borough",
+       y = "total number of shooting victims",
+       title = "shooting victims by borough & race",
+       fill = "perpetrator's race") + # Adds commas as thousand separators
+  scale_y_continuous(
+    labels = function(x) format(x, big.mark = ",")  
+  ) + # Set the legend title & change legend labels
+  scale_fill_discrete(
+    name = "perpetrator's race",                                          
+    labels = c("AMERICAN INDIAN/ALASKAN NATIVE" = "American Indian / Alaskan Native", 
+               "ASIAN / PACIFIC ISLANDER" = "Asian / Pacific Islander", 
+               "BLACK" = "Black",
+               "BLACK HISPANIC" = "Black Hispanic",
+               "WHITE" = "White",
+               "WHITE HISPANIC" = "White Hispanic") # New labels for the legend  
+  )
+```
+
+The next plot shows the monthly shooting victims by borough over the entire period:
+
+```{r, visualization 2, message=FALSE}
+# Step 1: Necessary data transformation
+daily_vict_by_bor <- complete_cleaned_data  %>% arrange(OCCUR_DATE) %>% 
+  group_by(OCCUR_DATE, borough) %>% summarize(shooting_victims = n()) %>% ungroup()
+
+
+monthly_vict_by_bor <- daily_vict_by_bor %>% 
+  mutate(month_year = floor_date(OCCUR_DATE, "month")) %>%
+  group_by(month_year,borough) %>% 
+  summarize(shooting_victims = sum(shooting_victims)) %>% ungroup()
+
+# Step 2: Plotting monthly shooting victims by borough over the entire period
+ggplot(data = monthly_vict_by_bor, mapping = aes(x = month_year, y = shooting_victims)) + 
+  geom_point(mapping = aes(color = borough)) + 
+  geom_smooth() +
+  labs(x = "time", 
+       y = "number of shooting victims",
+       title = "shooting victims by borough over time") 
+```
+
+Since our objective is to predict the likelihood of a fatal outcome from a shooting, let us examine `STATISTICAL_MURDER_FLAG`, which serves as an indicator of whether the shooting resulted in the victim’s death.
+
+```{r, visualization 3, message=FALSE}
+# Piechart of outcome variable STATISTICAL_MURDER_FLAG
+pie_data <- complete_cleaned_data %>% 
+  select(STATISTICAL_MURDER_FLAG)
+
+# Summarize counts and calculate percentages
+pie_data <- pie_data %>%
+  count(STATISTICAL_MURDER_FLAG) %>%
+  mutate(percentage = n / sum(n) * 100,
+         label = paste0(round(percentage, 1), "%\n(n = ", n, ")")
+  )
+
+# Define colors for logical values (TRUE/FALSE)
+colors <- c("TRUE" = "#F8766D", "FALSE" = "#00BA38")
+
+# Create pie chart for STATISTICAL_MURDER_FLAG
+ggplot(pie_data, aes(x = "", y = n, fill = STATISTICAL_MURDER_FLAG)) +
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar(theta = "y") +
+  theme_void() +
+  geom_text(aes(label = label), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = colors) +
+  labs(title = "Distribution of Statistical_Murder_Flag") 
+```
+
+
+### Modelling Data
+
+Let's now examine whether we can predict the death of a victim (`STATISTICAL_MURDER_FLAG = TRUE)` using the variables `perpetrator_age_group` and `borough`. Since the outcome variable is binary, we are going to use logistic regression for this analysis. Before implementing the regression, we will split the dataset into training and test sets. The training set, comprising 70% of the data, will be used to train the model. 
+
+```{r, creating training and test subsets}
+set.seed(1)
+split <- sample.split(complete_cleaned_data$STATISTICAL_MURDER_FLAG, SplitRatio = 0.7)
+
+train_set <- subset(complete_cleaned_data, split == TRUE)
+test_set <- subset(complete_cleaned_data, split == FALSE)
+```
+
+```{r, training the model}
+model <- glm(STATISTICAL_MURDER_FLAG ~ perpetrator_age_group + borough, 
+             data = train_set, 
+             family = binomial
+)
+model_summary <- summary(model)
+rownames(model_summary$coefficients) <-  rownames(model_summary$coefficients) %>%
+  gsub("borough", "", .) %>%
+  tolower() %>% gsub("(\\w)(\\w*)", "\\U\\1\\L\\2", ., perl = TRUE) %>%
+  gsub("_", " ", .) %>%                # Replace underscores with spaces
+  gsub("age group", "age group: ", .) %>%  # Add colon after "age group"
+  gsub("Perpetrator ", "Perpetrator's ", .) # Convert "Perpetrator" to "Perpetrator's"
+model_summary
+```
+
+`exp(coef(model_summary))`is a handy method for illustrating the change in the odds ratio when moving from the reference category to another category of an independent variable. For example, an odds ratio of 0.878 for the borough of Brooklyn indicates that, ceteris paribus, a shootout in this area has an odds ratio that is 0.878 times higher (or equivalently 12.21% lower) compared to the reference borough, the Bronx.
+
+```{r, odds ratio}
+exp(coef(model_summary))
+```
+
+Finally, let's use this model to **predict** the **probabilities** of the victim's death on the test subset:
+
+```{r, prediction results on test data}
+test_set$predicted_prob <- predict(model, newdata = test_set, type = "response")
+test_set$odds <- exp(predict(model, newdata = test_set, type = "link")) 
+formatted_test_set <- test_set %>% select(borough, 
+                                          perpetrator_age_group, 
+                                          predicted_prob, 
+                                          odds)
+head(formatted_test_set, n = 10)
+```
+
+
+### Conclusion
+
+
+In our logistic regression analysis, we examined the effects of both the perpetrator's age group and the borough of the incident on the probability of a victim dying as a result. All coefficients, except for those corresponding to the boroughs of Queens and Staten Island, show a significant impact. The results indicate that perpetrators in the age groups 18-24, 25-44, 45-64, and 65+ have a higher likelihood of a fatal outcome compared to the baseline group of individuals under 18. One possible explanation for this is that incidents involving younger individuals, particularly those under 18, may have a higher chance of being accidental.
+
+Additionally, shootings occurring in the Bronx exhibit the highest probability of resulting in death compared to the other boroughs. However, these results should be interpreted with caution due to the assumption that missing data are Missing Completely at Random (MCAR). If this assumption is incorrect, it could introduce **bias** into the analysis, which could undermine the validity of the findings.
+
+To address potential issues and ensure the integrity of the analysis, I employed appropriate statistical techniques, including logistic regression, and maintained transparency about my assumptions, such as the MCAR assumption. To further mitigate inherent bias in the data, outliers were removed. Additionally, to eliminate personal bias in the form of motivational bias, I adhered to predefined criteria throughout the process. For instance, I did not repeatedly rearrange the training and test datasets or adjust their sizes until achieving the desired outcome. Instead, I pre-established the training dataset size at 70% prior to the analysis. Furthermore, I conducted multiple reviews over the past few days to further minimize personal bias and uphold the integrity of the analysis.
